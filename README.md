@@ -3,7 +3,7 @@ This repository provides a local-executable Python script for sensor-space SPN a
 ## Repository layout
 
 ```
-spn-eeg-analysis/
+analyze_spn/
 ├── analyze_spn.py          # Main analysis script (CLI)
 ├── requirements.txt        # Python dependencies
 ├── LICENSE                 # MIT
