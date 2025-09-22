@@ -1,3 +1,5 @@
+[Dataset DOI] https://doi.org/10.5281/zenodo.17173946
+
 This repository provides a local-executable Python script for sensor-space SPN analyses, cluster-based permutation tests (MNE), mixed-effects models (statsmodels), and a binomial GLM linking SPN (in noise) to speech-in-noise accuracy.
 
 ## Repository layout
