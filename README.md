@@ -1,5 +1,6 @@
 # SPN/CNV EEG preprocessing and analysis pipeline
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.19344047.svg)](https://doi.org/10.5281/zenodo.19344047)
+This repository contains the analysis code only.  
+The dataset is available on Zenodo: [https://doi.org/10.5281/zenodo.19344047](https://doi.org/10.5281/zenodo.19344047)
 
 This repository contains a MATLAB/EEGLAB preprocessing pipeline and a Python-based analysis workflow for SPN and CNV EEG data.
 
@@ -257,11 +258,12 @@ Common outputs include:
 - Speech-in-noise analyses are exploratory.
 - Topographic maps are descriptive and are not used as standalone inferential tests.
 
-## Citation
-If you use this repository, please cite the Zenodo archive:
+## Data availability
 
-> Kazuhiro Okamoto. 2026. *SPN/CNV EEG preprocessing and analysis pipeline*. Zenodo. https://doi.org/10.5281/zenodo.19344047
-If you use this repository in academic work, cite the associated article or project documentation. Adapt the methods, path settings, and metadata files as needed for your dataset.
+The dataset used for the analyses in this repository is publicly available on Zenodo:
+[https://doi.org/10.5281/zenodo.19344047](https://doi.org/10.5281/zenodo.19344047)
+
+Please download the dataset from Zenodo before running the preprocessing or analysis scripts.
 
 ## License
 
