@@ -257,8 +257,10 @@ Common outputs include:
 - Speech-in-noise analyses are exploratory.
 - Topographic maps are descriptive and are not used as standalone inferential tests.
 
-## Citation and reuse
+## Citation
+If you use this repository, please cite the Zenodo archive:
 
+> Author(s). Year. *SPN/CNV EEG preprocessing and analysis pipeline*. Zenodo. https://doi.org/10.5281/zenodo.19344047
 If you use this repository in academic work, cite the associated article or project documentation. Adapt the methods, path settings, and metadata files as needed for your dataset.
 
 ## License
