@@ -1,5 +1,5 @@
 # SPN/CNV EEG preprocessing and analysis pipeline
-
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.19344047.svg)](https://doi.org/10.5281/zenodo.19344047)
 This repository contains a MATLAB/EEGLAB preprocessing pipeline and a Python-based analysis workflow for SPN and CNV EEG data.
 
 The repository is organized around two parts:
