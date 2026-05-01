@@ -13,9 +13,12 @@ This script:
 4. Runs ROI × Hemisphere mixed-effects models for SPN and CNV
 5. Optionally fits supplementary models with Sex
 6. Runs electrode-wise mixed-effects models with FDR correction
-7. Generates descriptive topographic and ROI-panel figures
-8. Optionally summarizes speech-in-noise performance and
-   computes exploratory correlations with EEG measures
+7. Adds reviewer-requested ROI-interaction models
+8. Adds BIC-approximated Bayes factors for condition-related terms
+9. Runs cluster-based permutation tests on participant-level difference maps
+10. Generates descriptive topographic and ROI-panel figures
+11. Optionally summarizes speech-in-noise and time-estimation performance and
+    computes exploratory correlations with EEG measures
 
 Inputs
 ------
@@ -26,6 +29,7 @@ Optional:
     electrode_metadata.csv
     run_qc.csv
     speech_accuracy.csv
+    time_estimation.csv or timing.csv
 
 Outputs
 -------
@@ -42,7 +46,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from scipy.stats import norm, t as student_t, pearsonr, spearmanr
+from scipy.stats import norm, t as student_t, pearsonr, spearmanr, ttest_rel
 from statsmodels.formula.api import mixedlm
 from statsmodels.stats.multitest import multipletests
 
@@ -108,6 +112,57 @@ def try_fit_mixed(formula, data, re="~Condition_c", group="Participant"):
             groups=data[group]
         ).fit(method="lbfgs", reml=True)
         return res, kind
+
+
+def try_fit_mixed_ml(formula, data, re="~Condition_c", group="Participant"):
+    """Fit a mixed model with ML, used for BIC-based model comparisons."""
+    kind = "random-slope"
+    try:
+        res = mixedlm(
+            formula,
+            data=data,
+            groups=data[group],
+            re_formula=re
+        ).fit(method="lbfgs", reml=False)
+        return res, kind
+    except Exception:
+        kind = "random-intercept"
+        res = mixedlm(
+            formula,
+            data=data,
+            groups=data[group]
+        ).fit(method="lbfgs", reml=False)
+        return res, kind
+
+
+def bic_bayes_factor(null_res, full_res):
+    """Return BIC-approximated BF10 and BF01 for full vs null model."""
+    bf10 = float(np.exp((null_res.bic - full_res.bic) / 2.0))
+    bf01 = float(1.0 / bf10) if bf10 != 0 else np.inf
+    return bf10, bf01
+
+
+def run_bic_bayes_comparison(data, component_label, comparison_label,
+                             null_formula, full_formula, out_rows,
+                             re="~Condition_c", group="Participant"):
+    """Fit null/full ML mixed models and append a BIC Bayes-factor summary row."""
+    null_res, null_kind = try_fit_mixed_ml(null_formula, data, re=re, group=group)
+    full_res, full_kind = try_fit_mixed_ml(full_formula, data, re=re, group=group)
+    bf10, bf01 = bic_bayes_factor(null_res, full_res)
+    out_rows.append({
+        "Component": component_label,
+        "Comparison": comparison_label,
+        "Null_formula": null_formula,
+        "Full_formula": full_formula,
+        "Null_random_effects": null_kind,
+        "Full_random_effects": full_kind,
+        "N_observations": int(full_res.nobs),
+        "Null_BIC": float(null_res.bic),
+        "Full_BIC": float(full_res.bic),
+        "Delta_BIC_full_minus_null": float(full_res.bic - null_res.bic),
+        "BF10_full_over_null": bf10,
+        "BF01_null_over_full": bf01
+    })
 
 
 def ids_with_two_levels(df, id_col, factor_col):
@@ -249,13 +304,18 @@ def plot_roi_condition_panels(desc_roi, out_path: Path,
     save_fig(fig, out_path, dpi=300, tight=True)
 
 
-def make_topomap_from_condition(mean_cond_df, condition_label, title, out_path: Path):
+def standardize_channel_names(ch_names):
+    """Map legacy 10-20 temporal labels to MNE standard_1020 names for plotting/adjacency."""
+    rename_map = {"T3": "T7", "T4": "T8", "T5": "P7", "T6": "P8"}
+    return [rename_map.get(str(ch), str(ch)) for ch in ch_names]
+
+
+def make_topomap_from_condition(mean_cond_df, condition_label, title, out_path: Path, vlim=None):
+    """Draw a topomap. Pass vlim=(low, high) to force a common color scale."""
     tmp = mean_cond_df[mean_cond_df["Condition"] == condition_label].copy()
     tmp = tmp.sort_values("Electrode")
     ch_names = tmp["Electrode"].astype(str).tolist()
-
-    rename_map = {"T3": "T7", "T4": "T8", "T5": "P7", "T6": "P8"}
-    ch_names_plot = [rename_map.get(ch, ch) for ch in ch_names]
+    ch_names_plot = standardize_channel_names(ch_names)
 
     info = mne.create_info(ch_names=ch_names_plot, sfreq=500, ch_types="eeg")
     montage = mne.channels.make_standard_montage("standard_1020")
@@ -264,13 +324,24 @@ def make_topomap_from_condition(mean_cond_df, condition_label, title, out_path: 
     data_v = (tmp["Mean_uV"].values * 1e-6).reshape(-1, 1)
     evk = mne.EvokedArray(data_v, info, tmin=0)
 
-    fig = evk.plot_topomap(
+    plot_kwargs = dict(
         times=[0],
         time_format="",
         scalings=dict(eeg=1e6),
         units=dict(eeg="µV"),
         show=False
     )
+    if vlim is not None:
+        plot_kwargs["vlim"] = vlim
+
+    try:
+        fig = evk.plot_topomap(**plot_kwargs)
+    except TypeError:
+        if vlim is not None:
+            plot_kwargs.pop("vlim", None)
+            plot_kwargs["vmin"], plot_kwargs["vmax"] = vlim
+        fig = evk.plot_topomap(**plot_kwargs)
+
     fig.suptitle(title)
     save_fig(fig, out_path, dpi=300, tight=True)
 
@@ -353,6 +424,191 @@ def roi_desc(roi_df):
     )
 
 
+def cluster_permutation_difference(long_df, out_csv: Path, component_label="SPN",
+                                   n_permutations=5000, seed=42):
+    """Cluster-based permutation test on participant-level noise-minus-silence maps.
+
+    The test uses only electrodes with complete paired data across participants.
+    This avoids interpolation/imputation and keeps the result conservative for a
+    low-density, non-interpolated montage.
+    """
+    mean_cond = (
+        long_df.groupby(["Participant", "Electrode", "Condition"], as_index=False)
+        .agg(Mean_uV=("Value_uV", "mean"))
+    )
+    wide = mean_cond.pivot_table(
+        index=["Participant", "Electrode"],
+        columns="Condition",
+        values="Mean_uV"
+    ).reset_index()
+
+    required = {"in noise", "in silence"}
+    if not required.issubset(wide.columns):
+        tbl = pd.DataFrame([{
+            "Component": component_label,
+            "Note": "Skipped: both in noise and in silence conditions were not available."
+        }])
+        save_table(tbl, out_csv)
+        return tbl
+
+    wide["Diff_uV"] = wide["in noise"] - wide["in silence"]
+    mat = wide.pivot(index="Participant", columns="Electrode", values="Diff_uV")
+    mat = mat.dropna(axis=1, how="any").dropna(axis=0, how="any")
+
+    if mat.shape[0] < 3 or mat.shape[1] < 2:
+        tbl = pd.DataFrame([{
+            "Component": component_label,
+            "Note": f"Skipped: insufficient complete paired data for cluster test (n={mat.shape[0]}, electrodes={mat.shape[1]})."
+        }])
+        save_table(tbl, out_csv)
+        return tbl
+
+    elec = list(mat.columns)
+    ch_plot = standardize_channel_names(elec)
+    info = mne.create_info(ch_names=ch_plot, sfreq=500, ch_types="eeg")
+    info.set_montage(mne.channels.make_standard_montage("standard_1020"))
+    adjacency, _ = mne.channels.find_ch_adjacency(info, ch_type="eeg")
+
+    X = mat.to_numpy(dtype=float)
+    t_obs, clusters, cluster_p, _ = mne.stats.permutation_cluster_1samp_test(
+        X,
+        n_permutations=n_permutations,
+        threshold=None,
+        tail=0,
+        adjacency=adjacency,
+        out_type="indices",
+        seed=seed,
+        verbose=False
+    )
+
+    rows = []
+    for i, (clu, pval) in enumerate(zip(clusters, cluster_p), start=1):
+        if isinstance(clu, tuple):
+            inds = np.asarray(clu[0], dtype=int)
+        else:
+            inds = np.where(np.asarray(clu))[0]
+        if inds.size == 0:
+            continue
+        stat = float(np.sum(t_obs[inds]))
+        polarity = "positive" if stat > 0 else "negative"
+        rows.append({
+            "Component": component_label,
+            "Cluster": i,
+            "Polarity": polarity,
+            "Electrodes": ";".join([elec[j] for j in inds]),
+            "N_participants": int(mat.shape[0]),
+            "N_electrodes_in_test": int(mat.shape[1]),
+            "Cluster_stat_sum_t": stat,
+            "Cluster_p": float(pval)
+        })
+
+    if not rows:
+        rows.append({
+            "Component": component_label,
+            "Cluster": np.nan,
+            "Polarity": "none",
+            "Electrodes": "",
+            "N_participants": int(mat.shape[0]),
+            "N_electrodes_in_test": int(mat.shape[1]),
+            "Cluster_stat_sum_t": np.nan,
+            "Cluster_p": np.nan
+        })
+
+    tbl = pd.DataFrame(rows).sort_values("Cluster_p", na_position="last")
+    save_table(tbl, out_csv)
+    return tbl
+
+
+def find_timing_file(input_dir: Path):
+    for target in ["time_estimation", "timing", "time_est", "response_time"]:
+        try:
+            return find_input_file(input_dir, target)
+        except Exception:
+            pass
+    return None
+
+
+def summarize_time_estimation(timing_csv: Path, tables_dir: Path, run_qc=None):
+    """Summarize absolute timing error by condition if a timing CSV is available."""
+    timing = pd.read_csv(timing_csv)
+    timing.columns = [c.strip() for c in timing.columns]
+    if "Participant" not in timing.columns or "Condition" not in timing.columns:
+        print("[WARN] Timing file found but skipped: Participant and Condition columns are required.")
+        return None
+
+    timing["Participant"] = (
+        timing["Participant"].astype(str).str.strip().str.replace("^P", "", regex=True).str.zfill(2)
+    )
+    timing["Condition"] = (
+        timing["Condition"].astype(str).str.strip().str.lower()
+        .replace({"noise": "in noise", "silence": "in silence"})
+    )
+
+    if run_qc is not None and "keep_primary_participant" in run_qc.columns:
+        keep_part = run_qc[["Participant", "keep_primary_participant"]].drop_duplicates()
+        timing = timing.merge(keep_part, on="Participant", how="left")
+        timing = timing[timing["keep_primary_participant"] == True].copy()
+
+    abs_candidates = [
+        "AbsoluteError_s", "absolute_error_s", "AbsError_s", "abs_error_s",
+        "AbsoluteError", "absolute_error", "abs_error", "TimingAbsError_s"
+    ]
+    estimate_candidates = [
+        "Estimate_s", "estimate_s", "ResponseTime_s", "response_time_s",
+        "ResponseTime", "response_time", "Elapsed_s", "elapsed_s", "RT_s", "rt_s"
+    ]
+
+    abs_col = next((c for c in abs_candidates if c in timing.columns), None)
+    if abs_col is not None:
+        timing["AbsoluteError_s"] = pd.to_numeric(timing[abs_col], errors="coerce").abs()
+    else:
+        est_col = next((c for c in estimate_candidates if c in timing.columns), None)
+        if est_col is None:
+            print("[WARN] Timing file found but skipped: no recognizable absolute-error or estimate column.")
+            return None
+        timing["AbsoluteError_s"] = (pd.to_numeric(timing[est_col], errors="coerce") - 4.0).abs()
+
+    part = (
+        timing.groupby(["Participant", "Condition"], as_index=False)
+        .agg(
+            mean_absolute_error_s=("AbsoluteError_s", "mean"),
+            n_trials=("AbsoluteError_s", "count")
+        )
+    )
+    save_table(part, tables_dir / "Supp_Table_TimeEstimationAbsoluteError_ParticipantByCondition.csv")
+
+    summary = (
+        part.groupby("Condition", as_index=False)
+        .agg(
+            n_participants=("Participant", "nunique"),
+            mean_absolute_error_s=("mean_absolute_error_s", "mean"),
+            sd_absolute_error_s=("mean_absolute_error_s", "std"),
+            mean_n_trials=("n_trials", "mean")
+        )
+    )
+    save_table(summary, tables_dir / "Supp_Table_TimeEstimationAbsoluteError_ByCondition.csv")
+
+    wide = part.pivot(index="Participant", columns="Condition", values="mean_absolute_error_s")
+    if {"in noise", "in silence"}.issubset(wide.columns):
+        paired = wide[["in silence", "in noise"]].dropna()
+        if len(paired) >= 2:
+            t_stat, p_val = ttest_rel(paired["in noise"], paired["in silence"], nan_policy="omit")
+            diff = paired["in noise"] - paired["in silence"]
+            test_tbl = pd.DataFrame([{
+                "Contrast": "in noise - in silence",
+                "N": int(len(paired)),
+                "mean_difference_s": float(diff.mean()),
+                "sd_difference_s": float(diff.std(ddof=1)),
+                "t": float(t_stat),
+                "p": float(p_val)
+            }])
+        else:
+            test_tbl = pd.DataFrame([{"Contrast": "in noise - in silence", "N": int(len(paired))}])
+        save_table(test_tbl, tables_dir / "Supp_Table_TimeEstimationAbsoluteError_PairedTest.csv")
+
+    return summary
+
+
 def corr_row(participant_summary, x, y, xname, yname):
     df = participant_summary[[x, y]].dropna()
     if len(df) < 3:
@@ -384,6 +640,8 @@ def main():
                         help="Optional path to run_qc.csv")
     parser.add_argument("--speech", type=str, default=None,
                         help="Optional path to speech_accuracy.csv")
+    parser.add_argument("--timing", type=str, default=None,
+                        help="Optional path to time-estimation/timing CSV for absolute-error summaries")
     args = parser.parse_args()
 
     input_dir = Path(args.input_dir)
@@ -480,6 +738,51 @@ def main():
     tbl_cnv = fe_table(res_cnv)
     save_table(tbl_cnv, tables_dir / "Table_Control_CNV_ROI_Hemisphere_LMM.csv")
 
+    # Reviewer-requested ROI interaction models. The central ROI remains the
+    # reference level in the default alphabetical coding of C(ROI).
+    formula_roi_interaction = "Mean_uV ~ Condition_c * C(ROI) + Hem_c + Condition_c:Hem_c"
+    res_spn_roi_int, kind_spn_roi_int = try_fit_mixed(formula_roi_interaction, spn_roi, re="~Condition_c", group="Participant")
+    tbl_spn_roi_int = fe_table(res_spn_roi_int)
+    save_table(tbl_spn_roi_int, tables_dir / "Supp_Table_SPN_ConditionByROI_LMM.csv")
+
+    res_cnv_roi_int, kind_cnv_roi_int = try_fit_mixed(formula_roi_interaction, cnv_roi, re="~Condition_c", group="Participant")
+    tbl_cnv_roi_int = fe_table(res_cnv_roi_int)
+    save_table(tbl_cnv_roi_int, tables_dir / "Supp_Table_CNV_ConditionByROI_LMM.csv")
+
+    # BIC-approximated Bayes factors. These are supplementary sensitivity
+    # analyses and should be described as BIC approximations, not as fully
+    # Bayesian mixed models with explicit priors.
+    bf_rows = []
+    formula_no_condition = "Mean_uV ~ Hem_c + C(ROI)"
+    formula_condition_main = "Mean_uV ~ Condition_c + Hem_c + C(ROI)"
+    formula_primary_no_condition_terms = "Mean_uV ~ Hem_c + C(ROI)"
+
+    for label, df_comp in [("SPN", spn_roi), ("CNV", cnv_roi)]:
+        run_bic_bayes_comparison(
+            df_comp, label,
+            "Condition main effect only",
+            formula_no_condition,
+            formula_condition_main,
+            bf_rows
+        )
+        run_bic_bayes_comparison(
+            df_comp, label,
+            "All condition-related terms in primary ROI x Hemisphere model",
+            formula_primary_no_condition_terms,
+            formula_primary,
+            bf_rows
+        )
+        run_bic_bayes_comparison(
+            df_comp, label,
+            "Added Condition x ROI terms beyond primary model",
+            formula_primary,
+            formula_roi_interaction,
+            bf_rows
+        )
+
+    bf_tbl = pd.DataFrame(bf_rows)
+    save_table(bf_tbl, tables_dir / "Supp_Table_BIC_BayesFactors_ConditionTerms.csv")
+
     fit_with_sex(spn_roi, spn_long, tables_dir / "Supp_Table_SPN_LMM_withSex.csv")
     fit_with_sex(cnv_roi, cnv_long, tables_dir / "Supp_Table_CNV_LMM_withSex.csv")
 
@@ -495,17 +798,27 @@ def main():
         .mean()
     )
 
+    # Use the same color scale for the silence and noise maps, as requested by
+    # the reviewer. The difference map below uses its own symmetric scale.
+    cond_vals = cond_means_spn[
+        cond_means_spn["Condition"].isin(["in silence", "in noise"])
+    ]["Mean_uV"].to_numpy(dtype=float)
+    cond_lim = float(np.nanmax(np.abs(cond_vals))) if np.isfinite(cond_vals).any() else None
+    shared_condition_vlim = (-cond_lim, cond_lim) if cond_lim and cond_lim > 0 else None
+
     make_topomap_from_condition(
         cond_means_spn,
         condition_label="in silence",
         title="SPN in silence (-200 to 0 ms)",
-        out_path=figures_dir / "Fig2a_SPN_topomap_in_silence.png"
+        out_path=figures_dir / "Fig2a_SPN_topomap_in_silence.png",
+        vlim=shared_condition_vlim
     )
     make_topomap_from_condition(
         cond_means_spn,
         condition_label="in noise",
         title="SPN in noise (-200 to 0 ms)",
-        out_path=figures_dir / "Fig2b_SPN_topomap_in_noise.png"
+        out_path=figures_dir / "Fig2b_SPN_topomap_in_noise.png",
+        vlim=shared_condition_vlim
     )
 
     pivot_diff = (
@@ -517,12 +830,31 @@ def main():
         diff_mean = pivot_diff.groupby("Electrode", as_index=False)["Mean_uV"].mean()
         diff_mean["Condition"] = "noise_minus_silence"
 
+        diff_lim = float(np.nanmax(np.abs(diff_mean["Mean_uV"].to_numpy(dtype=float))))
         make_topomap_from_condition(
             diff_mean,
             condition_label="noise_minus_silence",
             title="SPN Noise - Silence (µV)",
-            out_path=figures_dir / "Fig2c_SPN_topomap_difference.png"
+            out_path=figures_dir / "Fig2c_SPN_topomap_difference.png",
+            vlim=(-diff_lim, diff_lim) if diff_lim > 0 else None
         )
+
+    # Report the cluster-based permutation test because it is described in the
+    # manuscript. Results remain exploratory/descriptive for spatial localization.
+    cluster_permutation_difference(
+        spn_long,
+        tables_dir / "Supp_Table_SPN_ClusterPermutation_NoiseMinusSilence.csv",
+        component_label="SPN",
+        n_permutations=5000,
+        seed=42
+    )
+    cluster_permutation_difference(
+        cnv_long,
+        tables_dir / "Supp_Table_CNV_ClusterPermutation_NoiseMinusSilence.csv",
+        component_label="CNV",
+        n_permutations=5000,
+        seed=42
+    )
 
     spn_desc = roi_desc(spn_roi)
     cnv_desc = roi_desc(cnv_roi)
@@ -549,14 +881,30 @@ def main():
         "CNV is included as a response-locked control analysis.",
         "Primary inference is ROI x Hemisphere LMM without Sex covariate.",
         "Sex-adjusted models are supplementary only.",
-        "Cluster-based inferential analyses are not used.",
-        "SPN topomaps are descriptive only and are shown in µV."
+        "Central ROI is included in ROI models and is the reference level for C(ROI).",
+        "Reviewer-requested Condition x ROI models are saved as supplementary tables.",
+        "BIC-approximated Bayes factors are supplementary sensitivity analyses fitted with ML.",
+        "Cluster-based permutation tables are exploratory spatial analyses and are not used to define follow-up ROIs.",
+        "SPN condition topomaps use a common color scale for silence and noise; the difference map uses its own symmetric scale.",
+        "SPN topomaps are descriptive and are shown in µV."
     ]
     notes_path = output_dir / "ANALYSIS_NOTES_SPN_CNV_REVISED.txt"
     with open(notes_path, "w", encoding="utf-8") as f:
         for line in notes:
             f.write(line + "\n")
     print(f"[Saved] {notes_path}")
+
+    if args.timing:
+        timing_csv = Path(args.timing)
+        print(f"[INFO] Using timing CSV: {timing_csv}")
+        summarize_time_estimation(timing_csv, tables_dir, run_qc=run_qc)
+    else:
+        timing_csv = find_timing_file(input_dir)
+        if timing_csv is not None:
+            print(f"[INFO] Using timing CSV: {timing_csv}")
+            summarize_time_estimation(timing_csv, tables_dir, run_qc=run_qc)
+        else:
+            print("[WARN] time-estimation/timing CSV not found. Skipping absolute-error summaries.")
 
     if args.speech:
         speech_csv = Path(args.speech)
